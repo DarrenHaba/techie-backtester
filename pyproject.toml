@@ -16,7 +16,13 @@ license = "MIT"
 python = ">=3.13,<3.14"
 # Cortex provides FastAPI, uvicorn, websockets, watchfiles, FlexTag, FTML.
 techie-cortex = { path = "../techie-cortex", develop = true }
-# Inc 1 will add: nautilus_trader, httpx (for techie-historical-data calls).
+# Engine: NautilusTrader is the event-driven backtester core. LGPL-3.0,
+# Rust core + Python bindings. See techie-trader/doc/dev/backtester/
+# DECISIONS.md for the rationale.
+nautilus_trader = ">=1.200"
+# HTTP client for talking to techie-historical-data.
+httpx = ">=0.27"
+python-dotenv = ">=1.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

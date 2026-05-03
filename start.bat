@@ -4,11 +4,13 @@ setlocal enabledelayedexpansion
 :: ========================================================================
 :: Techie Backtester - Start Script (Windows dev)
 ::
-:: Inc 0: backend only. The frontend folder is added in Inc 1; once it
-:: exists this script will also start Vite on FRONTEND_PORT.
+:: Kills anything on ports 8103 (backend) and 5177 (frontend Vite),
+:: starts both servers, waits for health checks, opens the browser.
+:: Run again to restart cleanly.
 ::
 :: First-time setup:
 ::   poetry install
+::   cd frontend && npm install && cd ..
 :: ========================================================================
 
 set BACKEND_PORT=8103
@@ -22,7 +24,7 @@ echo.
 :: --------------------------------------------------------------------
 :: 1. Kill previous instances
 :: --------------------------------------------------------------------
-echo [1/3] Clearing previous instances...
+echo [1/4] Clearing previous instances...
 
 taskkill /FI "WINDOWTITLE eq TechieBacktester-Backend" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq TechieBacktester-Frontend" /F >nul 2>&1
@@ -43,7 +45,7 @@ echo   Ports cleared.
 :: --------------------------------------------------------------------
 :: 2. Start the backend
 :: --------------------------------------------------------------------
-echo [2/3] Starting backend on port %BACKEND_PORT%...
+echo [2/4] Starting backend on port %BACKEND_PORT%...
 start "TechieBacktester-Backend" cmd /c "cd /d "%PROJECT_DIR%" && poetry run uvicorn techie_backtester.server:app --reload --host 127.0.0.1 --port %BACKEND_PORT%"
 
 echo   Waiting for backend...
@@ -69,20 +71,47 @@ if !BACKEND_READY! == 0 (
 )
 
 :: --------------------------------------------------------------------
-:: 3. Open browser to backend docs (no frontend yet in Inc 0)
+:: 3. Start the frontend (Vite dev)
 :: --------------------------------------------------------------------
-echo [3/3] Opening browser to API docs...
-start "" http://127.0.0.1:%BACKEND_PORT%/docs
+echo [3/4] Starting frontend on port %FRONTEND_PORT%...
+start "TechieBacktester-Frontend" cmd /c "cd /d "%PROJECT_DIR%frontend" && npm run dev"
+
+echo   Waiting for frontend...
+set FRONTEND_READY=0
+for /L %%i in (1,1,20) do (
+    if !FRONTEND_READY! == 0 (
+        timeout /t 1 /nobreak >nul
+        curl -s -o nul -w "%%{http_code}" http://127.0.0.1:%FRONTEND_PORT%/ >"%TEMP%\tbt_health.txt" 2>nul
+        set /p HEALTH_CODE=<"%TEMP%\tbt_health.txt"
+        if "!HEALTH_CODE!" == "200" (
+            set FRONTEND_READY=1
+            echo.
+            echo   Frontend ready.
+        ) else (
+            <nul set /p =.
+        )
+    )
+)
+
+if !FRONTEND_READY! == 0 (
+    echo.
+    echo   WARNING: Frontend did not respond after 20s. Continuing anyway...
+)
+
+:: --------------------------------------------------------------------
+:: 4. Open browser to the frontend
+:: --------------------------------------------------------------------
+echo [4/4] Opening browser...
+start "" http://127.0.0.1:%FRONTEND_PORT%/
 
 echo.
 echo === Running ===
 echo   Backend:  http://127.0.0.1:%BACKEND_PORT%
+echo   Frontend: http://127.0.0.1:%FRONTEND_PORT%
 echo   Health:   http://127.0.0.1:%BACKEND_PORT%/api/health
 echo   Docs:     http://127.0.0.1:%BACKEND_PORT%/docs
 echo.
-echo   (Frontend on port %FRONTEND_PORT% will be added in Inc 1.)
-echo.
-echo Close the Backend window to stop, or run start.bat again to restart.
+echo Close the Backend and Frontend windows to stop, or run start.bat again to restart.
 echo.
 
 endlocal
