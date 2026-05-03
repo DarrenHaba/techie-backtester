@@ -159,6 +159,106 @@ def _safe_float(v: Any) -> float | None:
     return f
 
 
+def _compute_equity_curve(
+    bars_raw: list[dict[str, Any]],
+    fills_records: list[dict[str, Any]],
+    starting_cash: float,
+) -> list[dict[str, Any]]:
+    """Mark-to-market equity at each bar's close.
+
+    Walks bars in chronological order, applying fills as they happen,
+    and reports `equity = cash + position_qty * bar.close` per bar. This
+    is the proper portfolio-value time series. We don't use Nautilus's
+    `account_report` because it only emits a row per cash event (one on
+    initial deposit, one per fill), which gives you a 3-point sawtooth
+    for a buy-and-hold instead of a smooth curve, and produces nonsense
+    drawdowns.
+    """
+    # Normalize fill timestamps + sort.
+    parsed_fills: list[dict[str, Any]] = []
+    for f in fills_records:
+        # ts_last / ts_init come back as ISO strings from _df_to_records.
+        ts_raw = f.get("ts_last") or f.get("ts_init")
+        if ts_raw is None:
+            continue
+        try:
+            ts_dt = pd.Timestamp(ts_raw)
+            if ts_dt.tz is None:
+                ts_dt = ts_dt.tz_localize("UTC")
+            else:
+                ts_dt = ts_dt.tz_convert("UTC")
+        except Exception:
+            continue
+        side = str(f.get("side", "")).upper()
+        try:
+            qty = float(f.get("filled_qty") or f.get("quantity") or 0)
+            px = float(f.get("avg_px") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or px <= 0:
+            continue
+        parsed_fills.append({"ts": ts_dt, "side": side, "qty": qty, "px": px})
+    parsed_fills.sort(key=lambda x: x["ts"])
+
+    cash = float(starting_cash)
+    qty = 0.0
+    fill_idx = 0
+    curve: list[dict[str, Any]] = []
+
+    for raw in bars_raw:
+        try:
+            bar_ts = pd.Timestamp(raw["datetime_utc"])
+            if bar_ts.tz is None:
+                bar_ts = bar_ts.tz_localize("UTC")
+            close = float(raw["close"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        # Apply any fills whose timestamp is <= this bar's timestamp.
+        while fill_idx < len(parsed_fills) and parsed_fills[fill_idx]["ts"] <= bar_ts:
+            f = parsed_fills[fill_idx]
+            if f["side"] == "BUY":
+                cash -= f["qty"] * f["px"]
+                qty += f["qty"]
+            elif f["side"] == "SELL":
+                cash += f["qty"] * f["px"]
+                qty -= f["qty"]
+            fill_idx += 1
+
+        equity = cash + qty * close
+        curve.append({
+            "timestamp": bar_ts.isoformat(),
+            "equity": round(equity, 2),
+            "cash": round(cash, 2),
+            "position_qty": qty,
+            "position_value": round(qty * close, 2),
+            "close": close,
+        })
+
+    return curve
+
+
+def _max_drawdown_pct(curve: list[dict[str, Any]]) -> float | None:
+    """Return max peak-to-trough drawdown as a positive percent.
+
+    e.g. an equity that fell from 100k to 95k somewhere along the way
+    returns 5.0 (i.e. 5.0%). Returns None for curves with < 2 points.
+    """
+    if len(curve) < 2:
+        return None
+    peak = curve[0]["equity"]
+    max_dd = 0.0
+    for p in curve:
+        eq = p["equity"]
+        if eq > peak:
+            peak = eq
+        if peak > 0:
+            dd = (peak - eq) / peak
+            if dd > max_dd:
+                max_dd = dd
+    return round(max_dd * 100.0, 4)
+
+
 def _df_to_records(df: pd.DataFrame | None) -> list[dict[str, Any]]:
     """Convert a (maybe-None, maybe-empty) DataFrame to JSON-safe records."""
     if df is None or df.empty:
@@ -286,15 +386,6 @@ def _run_engine_sync(
         except Exception:
             positions_report = None
 
-        equity_curve: list[dict[str, Any]] = []
-        if account_report is not None and not account_report.empty:
-            for ts, row in account_report.iterrows():
-                eq = _safe_float(row.get("total"))
-                if eq is None:
-                    continue
-                ts_iso = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
-                equity_curve.append({"timestamp": ts_iso, "equity": eq})
-
         # Stats ------------------------------------------------------------
         try:
             stats_pnl = engine.portfolio.analyzer.get_performance_stats_pnls(USD)
@@ -306,6 +397,17 @@ def _run_engine_sync(
             stats_returns = {}
 
         positions_records = _df_to_records(positions_report)
+        fills_records = _df_to_records(fills_report)
+
+        # Build a proper mark-to-market equity curve from bars + fills.
+        # Nautilus's account_report is useless for this — see
+        # _compute_equity_curve docstring.
+        equity_curve = _compute_equity_curve(
+            bars_raw=bars_raw,
+            fills_records=fills_records,
+            starting_cash=starting_cash,
+        )
+
         # Sum realized pnl from positions (engine.portfolio numbers can be None
         # when the position closed exactly at the last bar; this is a fallback).
         realized_pnl = 0.0
@@ -316,19 +418,27 @@ def _run_engine_sync(
 
         starting_eq = equity_curve[0]["equity"] if equity_curve else starting_cash
         ending_eq = equity_curve[-1]["equity"] if equity_curve else starting_cash
+        peak_eq = max((p["equity"] for p in equity_curve), default=starting_cash)
+        trough_eq = min((p["equity"] for p in equity_curve), default=starting_cash)
         total_return_pct = (
             ((ending_eq - starting_eq) / starting_eq * 100.0)
             if starting_eq > 0
             else None
         )
+        max_dd_pct = _max_drawdown_pct(equity_curve)
 
         stats = {
             "starting_equity": _safe_float(starting_eq),
             "ending_equity": _safe_float(ending_eq),
+            "peak_equity": _safe_float(peak_eq),
+            "trough_equity": _safe_float(trough_eq),
             "total_return_pct": _safe_float(total_return_pct),
             "realized_pnl": _safe_float(realized_pnl),
+            # Nautilus's Sharpe is computed from its own (broken-for-our-case)
+            # returns series; surface it but with the caveat that it's only
+            # meaningful once we compute returns from our own equity curve.
             "sharpe_ratio": _safe_float(stats_returns.get("Sharpe Ratio (252 days)")),
-            "max_drawdown_pct": _safe_float(stats_returns.get("Max Drawdown (Returns)")),
+            "max_drawdown_pct": max_dd_pct,
             "trade_count": len(positions_records),
             "bar_count": len(nautilus_bars),
             "bars_dropped_invalid": dropped,

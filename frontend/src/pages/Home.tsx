@@ -34,10 +34,12 @@ interface Trade {
 interface BacktestStats {
   starting_equity?: number | null
   ending_equity?: number | null
+  peak_equity?: number | null
+  trough_equity?: number | null
   total_return_pct?: number | null
   realized_pnl?: number | null
   sharpe_ratio?: number | null
-  max_drawdown_pct?: number | null
+  max_drawdown_pct?: number | null  // already in percent units (5.0 = 5%)
   trade_count?: number
   bar_count?: number
   bars_dropped_invalid?: number
@@ -211,10 +213,11 @@ function EquityCurveSvg({ points }: { points: EquityPoint[] }) {
       </text>
       {/* line */}
       <path d={path} stroke="#fbbf24" strokeWidth={1.5} fill="none" />
-      {/* points */}
-      {data.map((d, i) => (
-        <circle key={i} cx={x(i)} cy={y(d.v)} r={2} fill="#fbbf24" />
-      ))}
+      {/* points only when sparse — too noisy at hundreds of bars */}
+      {data.length <= 40 &&
+        data.map((d, i) => (
+          <circle key={i} cx={x(i)} cy={y(d.v)} r={2} fill="#fbbf24" />
+        ))}
     </svg>
   )
 }
@@ -443,12 +446,15 @@ export function HomePage() {
                 value={
                   stats.max_drawdown_pct == null
                     ? '—'
-                    : fmtPct((stats.max_drawdown_pct ?? 0) * 100)
+                    : `-${fmtNum(stats.max_drawdown_pct, 2)}%`
                 }
+                tone={(stats.max_drawdown_pct ?? 0) > 0 ? 'neg' : undefined}
                 big
               />
               <Stat label="Starting equity" value={fmtMoney(stats.starting_equity)} />
               <Stat label="Ending equity" value={fmtMoney(stats.ending_equity)} />
+              <Stat label="Peak equity" value={fmtMoney(stats.peak_equity)} />
+              <Stat label="Trough equity" value={fmtMoney(stats.trough_equity)} />
               <Stat label="Trade count" value={String(stats.trade_count ?? 0)} />
               <Stat
                 label="Bars"
