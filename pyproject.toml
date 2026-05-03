@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "techie-backtester"
+version = "0.1.0a0"
+description = "Local cortex service that wraps NautilusTrader for strict event-driven backtesting against techie-historical-data. Part of the Techie trading ecosystem."
+authors = ["DarrenHaba <darrenhaba@live.com>"]
+readme = "README.md"
+packages = [{ include = "techie_backtester", from = "src" }]
+license = "MIT"
+
+[tool.poetry.urls]
+"Homepage" = "https://github.com/DarrenHaba/techie-backtester"
+"Repository" = "https://github.com/DarrenHaba/techie-backtester"
+"Bug Tracker" = "https://github.com/DarrenHaba/techie-backtester/issues"
+
+[tool.poetry.dependencies]
+python = ">=3.13,<3.14"
+# Cortex provides FastAPI, uvicorn, websockets, watchfiles, FlexTag, FTML.
+techie-cortex = { path = "../techie-cortex", develop = true }
+# Inc 1 will add: nautilus_trader, httpx (for techie-historical-data calls).
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+ruff = "^0.9.0"
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

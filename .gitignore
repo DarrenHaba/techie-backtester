@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+.DS_Store
+
+# Backtest run results — local only, never committed
+data/runs/
+
+# Frontend (added in Inc 1)
+frontend/node_modules/
+frontend/dist/
+
+# Runtime logs
+logs/
