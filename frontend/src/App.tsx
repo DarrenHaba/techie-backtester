@@ -8,7 +8,7 @@ export function App() {
           Techie Backtester
         </span>
         <span className="text-[11px] text-neutral-500">
-          Inc 1 — health probe only
+          local · BuyAndHold v0
         </span>
         <a
           href="/docs"
