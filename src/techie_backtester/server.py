@@ -26,6 +26,7 @@ from techie_cortex.actions import action_registry
 from . import __version__
 from .historical_client import HistoricalDataError, get_bars
 from .runner import list_available_strategies, run_backtest
+from .strategy_reload import reload_strategies as _do_reload_strategies
 
 log = logging.getLogger(__name__)
 
@@ -66,9 +67,22 @@ async def _health() -> dict:
 
 async def _list_strategies() -> list[dict[str, Any]]:
     """Names + per-strategy param schemas. Driven by the registry in
-    techie-strategies-private — drop a new .py file there, restart this
-    service, and it shows up here."""
+    techie-strategies-private — drop a new .py file there and call
+    `reload_strategies` (or restart this service) to discover it."""
     return list_available_strategies()
+
+
+async def _reload_strategies() -> dict[str, Any]:
+    """Hot-reload strategies from disk without restarting the service.
+
+    Re-imports every module under techie_strategies_private.strategies
+    and resets the registry cache. Lets a notebook cell write a new
+    .py file, hot-reload, and immediately backtest it.
+
+    Returns a summary: {ok, reloaded: [...], newly_imported: [...],
+    strategies: [...names], errors: [...]}.
+    """
+    return _do_reload_strategies()
 
 
 async def _run_backtest(
@@ -167,6 +181,7 @@ async def _run_backtest(
 def _register_actions() -> None:
     action_registry.register("health", _health)
     action_registry.register("list_strategies", _list_strategies)
+    action_registry.register("reload_strategies", _reload_strategies)
     action_registry.register("run_backtest", _run_backtest)
 
 
