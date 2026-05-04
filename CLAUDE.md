@@ -2,67 +2,55 @@
 
 ## Status
 
-**Inc 0 shipped 2026-04-29.** Bare cortex scaffold — the service boots
-and exposes the default cortex endpoints. No custom actions, no
-frontend, no NautilusTrader dependency yet. Inc 1 (next) adds those.
+Working. Strategy registry + hot-reload + mark-to-market equity curve
+all in place. Three strategies registered (BuyAndHold, SmaCrossover,
+MomentumBreakout). Notebook-driven workflow proven end-to-end.
 
-The build plan and rationale live in **`techie-trader/doc/dev/backtester/`**:
+The build plan lives in
+[`techie-trader/doc/dev/backtester/`](../techie-trader/doc/dev/backtester/):
 - [README.md](../techie-trader/doc/dev/backtester/README.md) — increments
-- [DECISIONS.md](../techie-trader/doc/dev/backtester/DECISIONS.md) — why
+- [DECISIONS.md](../techie-trader/doc/dev/backtester/DECISIONS.md) — rationale
 
-Read those before adding code. They're the ground truth for what this
-service is, what it isn't, and what order to build it in.
+Read both before changing architecture.
 
 ## Pattern
 
 This service follows the canonical
 [cortex service pattern](../techie-cortex/doc/patterns/service.md).
-Read it for project layout, pyproject conventions, workspace
-integration. Don't reinvent.
+Don't reinvent. Service-specific notes live in
+[`doc/README.md`](doc/README.md).
 
-Service-specific notes live in [`doc/README.md`](doc/README.md).
+## What goes here vs where
 
-## What this IS for
-
-- Wrapping NautilusTrader's `BacktestEngine` to run strategies against
-  historical bars from `techie-historical-data`.
-- Producing JSON results (equity curve, trades, stats) that the
-  `techie-trader` notebook renders in cells.
-- Providing a UI for kicking off runs, viewing run history, and
-  inspecting results outside the notebook.
-
-## What this is NOT for
-
-- **Live trading.** Different repo (`techie-bot`, future). Same
-  strategies, different runtime.
-- **Research / free-form data exploration.** That's the notebook in
-  `techie-trader` against `techie-historical-data` directly.
-- **Holding strategy code.** Strategies live in
-  `techie-strategies-private` (separate, private repo). This service
-  imports them.
-- **Owning historical data.** This service reads from
-  `techie-historical-data` over HTTP. It does not have its own DuckDB.
+| Concern | Lives in |
+|---|---|
+| BacktestEngine wrapper, fill simulation, equity curve, drawdown | `src/techie_backtester/runner.py` |
+| FastAPI app + cortex actions (`run_backtest`, `list_strategies`, `reload_strategies`, `health`) | `src/techie_backtester/server.py` |
+| HTTP client for techie-historical-data | `src/techie_backtester/historical_client.py` |
+| Strategy hot-reload | `src/techie_backtester/strategy_reload.py` |
+| **Strategy classes themselves** | `techie-strategies-private` (separate, private repo) |
+| Strategy registry / discovery | `techie-strategies-private/src/techie_strategies_private/registry.py` |
+| Standalone Run-Backtest UI | `frontend/src/pages/Home.tsx` |
+| Notebook integration (the primary consumer) | `techie-trader` |
 
 ## Conventions
 
-- **Poetry** for Python deps (NOT uv — same convention as the rest of
-  the ecosystem; uv is only used for `techie-cortex/mcp`).
-- **npm** for frontend (added in Inc 1).
+- **Poetry** for Python deps (NOT uv — uv is only used for
+  `techie-cortex/mcp`).
+- **npm** for frontend.
 - **Python 3.13**, type hints on all functions.
 - **Functional React components**, named exports.
 - **Tailwind** for styling — no CSS modules.
-- **No secondary indexes on DuckDB tables** if/when we add a DuckDB
-  store later — see `techie-historical-data/CLAUDE.md` "Sharp edges"
-  for the lesson learned.
-- **Match the cortex service pattern.** When in doubt, look at how
+- Match the cortex service pattern. When in doubt, look at how
   `techie-historical-data` does the same thing.
 
 ## Tech stack
 
 - **Backend**: Python 3.13, FastAPI, uvicorn, Poetry
-- **Engine** (Inc 1+): NautilusTrader (LGPL, Rust core + Python)
+- **Engine**: NautilusTrader 1.226 (LGPL, Rust core + Python bindings)
+- **Strategies**: `techie-strategies-private` (editable path dep)
 - **HTTP client**: httpx (for techie-historical-data calls)
-- **Frontend** (Inc 1+): React 19, TypeScript strict, Vite, Tailwind 4
+- **Frontend**: React 19, TypeScript strict, Vite, Tailwind 4
 
 ## Ports
 
@@ -77,15 +65,70 @@ All under `C:\projects\github\`:
 
 | Repo | Purpose | This service touches it? |
 |---|---|---|
-| `techie-cortex` | Framework all services build on | Depend on it |
-| `techie-historical-data` | Local DuckDB for bars + articles | YES — pulls bars + articles via `get_bars` and articles read API |
-| `techie-trader` | Workstation / notebook hub | YES — notebook calls our `run_backtest` action and renders results |
-| `techie-strategies-private` | **Private** — strategy implementations | YES — `import` strategies from it |
-| `techie-live-data` | Droplet WS multiplexer | NO — only `techie-bot` consumes this |
-| `techie-symbols` | Symbol metadata service on droplet | NO directly — get symbols via historical-data |
+| `techie-cortex` | Framework all services build on | depend on it |
+| `techie-historical-data` | Local DuckDB for bars + articles | YES — pulls bars via `get_bars` HTTP action |
+| `techie-strategies-private` | **Private** — strategy implementations | YES — `import` strategies via the registry |
+| `techie-trader` | Workstation / notebook hub | YES — notebook calls our actions, renders results in cells |
+| `techie-live-data` | Droplet WS multiplexer | NO — only `techie-bot` will consume this |
+| `techie-symbols` | Symbol metadata service on droplet | NO directly |
 | `techie-bot` | Future droplet live runtime | NO yet — comes after backtester is solid |
 
-## Sharp edges (will accumulate)
+## Sharp edges (the stuff you'll forget)
 
-None yet — Inc 0 is too small. Anything learned in Inc 1+ that future
-sessions need to know goes here.
+- **Nautilus's Rust FFI logger initializes once per Python process.**
+  Without `LoggingConfig(bypass_logging=True)` the second
+  `BacktestEngine()` call in the same process panics with "attempted
+  to set a logger after the logging system was already initialized"
+  and crashes the worker thread. Bypass is on by default in
+  `runner.py`. Don't disable it.
+- **Money strings.** Nautilus formats `realized_pnl` as `"6710.00
+  USD"`. The `_safe_float` helper strips the currency suffix.
+- **Equity curve is OURS, not Nautilus's.** Nautilus's
+  `account_report` is per-cash-event (3 points for buy-and-hold).
+  `_compute_equity_curve` walks bars chronologically + applies fills
+  + marks position to market — produces one row per bar.
+- **`max_drawdown_pct` is in percent units (5.0 = 5%).** It's
+  computed from our equity curve, not from Nautilus's
+  `Max Drawdown (Returns)` stat (which uses Nautilus's broken series
+  and reports 0.0 for buy-and-hold).
+- **Daily timeframe only.** `runner.py` hardcodes
+  `BarType.from_str(f"{symbol}.XNAS-1-DAY-LAST-EXTERNAL")`. Minute
+  support means parameterizing this on timeframe.
+- **Strategy hot-reload uses `importlib.invalidate_caches()` +
+  `importlib.reload(strategies_pkg)`.** New `.py` files require BOTH
+  — `iter_modules` only sees them after the package itself is
+  reloaded.
+- **Windows strategy file writes need `encoding="utf-8"`.** Default
+  cp1252 encodes em-dashes as 0x97 which Python's source loader
+  rejects on import.
+- **`BacktestEngine.run()` is sync + CPU-bound.** We wrap with
+  `asyncio.to_thread` so the FastAPI event loop doesn't block. Don't
+  call it directly from an async handler.
+- **`add_venue` → `add_instrument` → `add_data` order matters.**
+  Nautilus enforces it; out-of-order calls raise `InvalidConfiguration`
+  or "instrument not found in cache".
+- **Nautilus's `Bar` enforces `low <= open,close <= high`** in its
+  constructor. `_to_nautilus_bar` validates first and returns None
+  for bad rows so one corrupt bar doesn't abort the whole run.
+
+## Authoring strategies
+
+DON'T put strategies in this repo. They live in
+`techie-strategies-private`. See its README for the convention
+(Strategy + StrategyConfig pair, system fields, naming).
+
+The notebook flow:
+```python
+# In a techie-trader notebook cell:
+Path("../techie-strategies-private/src/techie_strategies_private/strategies/my.py").write_text(
+    "...", encoding="utf-8"
+)
+await reload_strategies()
+await run_backtest(strategy="My", params={...}, ...)
+```
+
+## Tests
+
+`pytest` runs the smoke tests (module imports, server.py imports
+cleanly). No integration tests against a live historical-data
+instance yet.
