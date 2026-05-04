@@ -16,6 +16,12 @@ license = "MIT"
 python = ">=3.13,<3.14"
 # Cortex provides FastAPI, uvicorn, websockets, watchfiles, FlexTag, FTML.
 techie-cortex = { path = "../techie-cortex", develop = true }
+# Strategies: editable path dep so backtester picks up changes
+# without reinstalling. The strategies repo is private — anyone
+# pulling this project who doesn't have it will get a list_strategies
+# response with zero strategies registered, and run_backtest will
+# return a clear error.
+techie-strategies-private = { path = "../techie-strategies-private", develop = true }
 # Engine: NautilusTrader is the event-driven backtester core. LGPL-3.0,
 # Rust core + Python bindings. See techie-trader/doc/dev/backtester/
 # DECISIONS.md for the rationale.

@@ -1,13 +1,13 @@
 """Nautilus BacktestEngine wrapper.
 
-One function: `run_buy_and_hold(bars, symbol)`. Takes raw bar dicts,
-runs them through Nautilus's event-driven engine with a toy
-buy-and-hold Strategy, returns a JSON-friendly result dict.
+Looks up a Strategy class from techie-strategies-private's registry by
+name, instantiates it with user-supplied params plus the runtime-injected
+instrument_id + bar_type, runs it through Nautilus's BacktestEngine,
+and returns a JSON-friendly result.
 
-This is the v0 of the runner. Strategies will move into
-techie-strategies-private once we have something worth promoting; for
-now BuyAndHold is inlined here as the smoke-test case that proves the
-engine wiring works end-to-end.
+The strategy code itself lives in techie-strategies-private. This file
+is the thin wrapper that turns a (strategy_name, params, bars) request
+into a backtest run + a result dict.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import pandas as pd
 
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.common.config import LoggingConfig
-from nautilus_trader.config import BacktestEngineConfig, StrategyConfig
+from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.nautilus_pyo3 import MaxDrawdown, SharpeRatio
 from nautilus_trader.model.currencies import USD
@@ -29,8 +29,6 @@ from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.enums import (
     AccountType,
     OmsType,
-    OrderSide,
-    TimeInForce,
 )
 from nautilus_trader.model.identifiers import (
     InstrumentId,
@@ -40,52 +38,15 @@ from nautilus_trader.model.identifiers import (
 )
 from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Money, Price, Quantity
-from nautilus_trader.model.orders import MarketOrder
-from nautilus_trader.trading.strategy import Strategy
+
+# Strategy registry — single source of truth for available strategies.
+from techie_strategies_private.registry import (
+    StrategyInfo,
+    get_strategy,
+    list_strategies,
+)
 
 log = logging.getLogger(__name__)
-
-
-# --- Strategy --------------------------------------------------------------
-
-
-class BuyAndHoldConfig(StrategyConfig, frozen=True):  # type: ignore[call-arg,misc]
-    instrument_id: InstrumentId
-    bar_type: BarType
-    trade_size: Decimal
-
-
-class BuyAndHold(Strategy):
-    """Buy on the first bar, hold to the last, force-close at the end so
-    the position appears in the positions report with realized PnL."""
-
-    def __init__(self, config: BuyAndHoldConfig) -> None:
-        super().__init__(config)
-        self.entered = False
-
-    def on_start(self) -> None:
-        self.instrument = self.cache.instrument(self.config.instrument_id)
-        if self.instrument is None:
-            self.log.error(f"instrument {self.config.instrument_id} not found")
-            self.stop()
-            return
-        self.subscribe_bars(self.config.bar_type)
-
-    def on_bar(self, bar: Bar) -> None:
-        if self.entered:
-            return
-        order: MarketOrder = self.order_factory.market(
-            instrument_id=self.config.instrument_id,
-            order_side=OrderSide.BUY,
-            quantity=self.instrument.make_qty(self.config.trade_size),
-            time_in_force=TimeInForce.GTC,
-        )
-        self.submit_order(order)
-        self.entered = True
-
-    def on_stop(self) -> None:
-        # Realize the PnL so it shows in the positions report.
-        self.close_all_positions(self.config.instrument_id)
 
 
 # --- Bar conversion --------------------------------------------------------
@@ -113,7 +74,6 @@ def _to_nautilus_bar(
     except (KeyError, TypeError, ValueError):
         return None
     if v <= 0:
-        # Nautilus Quantity rejects 0 volume in some venue configs; skip.
         return None
     if not (lo <= o <= h and lo <= c <= h):
         return None
@@ -130,33 +90,8 @@ def _to_nautilus_bar(
     )
 
 
-# --- Result extraction -----------------------------------------------------
-
-
-def _safe_float(v: Any) -> float | None:
-    """Best-effort cast. None / NaN / non-numeric become None for JSON.
-
-    Also strips Nautilus Money formatting like "6710.00 USD" — the
-    positions report renders realized_pnl as a Money string, not a
-    number.
-    """
-    if v is None:
-        return None
-    if isinstance(v, str):
-        # Money objects render like "6710.00 USD" — strip the currency.
-        cleaned = v.split()[0] if v.split() else v
-        try:
-            f = float(cleaned)
-        except (TypeError, ValueError):
-            return None
-    else:
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None
-    if f != f:  # NaN
-        return None
-    return f
+# --- Equity curve + drawdown (mark-to-market, NOT Nautilus's broken
+#     account_report which only emits rows on cash events) ----------------
 
 
 def _compute_equity_curve(
@@ -164,20 +99,9 @@ def _compute_equity_curve(
     fills_records: list[dict[str, Any]],
     starting_cash: float,
 ) -> list[dict[str, Any]]:
-    """Mark-to-market equity at each bar's close.
-
-    Walks bars in chronological order, applying fills as they happen,
-    and reports `equity = cash + position_qty * bar.close` per bar. This
-    is the proper portfolio-value time series. We don't use Nautilus's
-    `account_report` because it only emits a row per cash event (one on
-    initial deposit, one per fill), which gives you a 3-point sawtooth
-    for a buy-and-hold instead of a smooth curve, and produces nonsense
-    drawdowns.
-    """
-    # Normalize fill timestamps + sort.
+    """Mark-to-market equity at each bar's close."""
     parsed_fills: list[dict[str, Any]] = []
     for f in fills_records:
-        # ts_last / ts_init come back as ISO strings from _df_to_records.
         ts_raw = f.get("ts_last") or f.get("ts_init")
         if ts_raw is None:
             continue
@@ -214,7 +138,6 @@ def _compute_equity_curve(
         except (KeyError, TypeError, ValueError):
             continue
 
-        # Apply any fills whose timestamp is <= this bar's timestamp.
         while fill_idx < len(parsed_fills) and parsed_fills[fill_idx]["ts"] <= bar_ts:
             f = parsed_fills[fill_idx]
             if f["side"] == "BUY":
@@ -239,11 +162,7 @@ def _compute_equity_curve(
 
 
 def _max_drawdown_pct(curve: list[dict[str, Any]]) -> float | None:
-    """Return max peak-to-trough drawdown as a positive percent.
-
-    e.g. an equity that fell from 100k to 95k somewhere along the way
-    returns 5.0 (i.e. 5.0%). Returns None for curves with < 2 points.
-    """
+    """Max peak-to-trough drawdown as a positive percent."""
     if len(curve) < 2:
         return None
     peak = curve[0]["equity"]
@@ -259,12 +178,33 @@ def _max_drawdown_pct(curve: list[dict[str, Any]]) -> float | None:
     return round(max_dd * 100.0, 4)
 
 
+# --- Helpers ---------------------------------------------------------------
+
+
+def _safe_float(v: Any) -> float | None:
+    """Best-effort cast; strips Money strings like '6710.00 USD'."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        cleaned = v.split()[0] if v.split() else v
+        try:
+            f = float(cleaned)
+        except (TypeError, ValueError):
+            return None
+    else:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+    if f != f:
+        return None
+    return f
+
+
 def _df_to_records(df: pd.DataFrame | None) -> list[dict[str, Any]]:
-    """Convert a (maybe-None, maybe-empty) DataFrame to JSON-safe records."""
     if df is None or df.empty:
         return []
     out = df.reset_index().to_dict(orient="records")
-    # Convert pandas Timestamps to ISO strings so json.dumps doesn't choke.
     for row in out:
         for k, v in list(row.items()):
             if isinstance(v, pd.Timestamp):
@@ -279,14 +219,63 @@ def _df_to_records(df: pd.DataFrame | None) -> list[dict[str, Any]]:
     return out
 
 
-# --- Public entry point ----------------------------------------------------
+# --- Public API ------------------------------------------------------------
+
+
+def list_available_strategies() -> list[dict[str, Any]]:
+    """Names + param schemas for every strategy in the registry."""
+    return [s.to_dict() for s in list_strategies()]
+
+
+def _coerce_param(value: Any, python_type: str) -> Any:
+    """Coerce a JSON-supplied param value to the right Python type for
+    the strategy's StrategyConfig. msgspec is strict — it won't accept
+    a JSON int where Decimal is required."""
+    if value is None:
+        return None
+    pt = python_type.lower()
+    try:
+        if "decimal" in pt:
+            return Decimal(str(value))
+        if "int" in pt:
+            return int(value)
+        if "float" in pt or "number" in pt:
+            return float(value)
+        if "bool" in pt:
+            return bool(value)
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _build_strategy(
+    info: StrategyInfo,
+    user_params: dict[str, Any],
+    instrument_id: InstrumentId,
+    bar_type: BarType,
+):
+    """Instantiate Strategy + Config from user-supplied params + the
+    runtime-injected instrument_id and bar_type."""
+    coerced: dict[str, Any] = {}
+    for fname, fmeta in info.params_schema.items():
+        if fname in user_params:
+            coerced[fname] = _coerce_param(
+                user_params[fname], fmeta.get("python_type", "")
+            )
+    config = info.config_class(
+        instrument_id=instrument_id,
+        bar_type=bar_type,
+        **coerced,
+    )
+    return info.strategy_class(config), config
 
 
 def _run_engine_sync(
     bars_raw: list[dict[str, Any]],
     symbol: str,
     starting_cash: float,
-    trade_size: float,
+    strategy_name: str,
+    user_params: dict[str, Any],
 ) -> dict[str, Any]:
     """Synchronous Nautilus run. Wrapped in to_thread by the async caller."""
     if not bars_raw:
@@ -299,6 +288,12 @@ def _run_engine_sync(
             "fills": [],
         }
 
+    # Look up the strategy.
+    try:
+        info = get_strategy(strategy_name)
+    except KeyError as e:
+        return {"ok": False, "error": str(e), "stats": {}, "equity_curve": [], "trades": [], "fills": []}
+
     venue = Venue("XNAS")
     instrument_id = InstrumentId(symbol=Symbol(symbol), venue=venue)
     instrument = Equity(
@@ -307,7 +302,7 @@ def _run_engine_sync(
         currency=USD,
         price_precision=2,
         price_increment=Price.from_str("0.01"),
-        lot_size=Quantity.from_int(1),  # allow arbitrary share counts
+        lot_size=Quantity.from_int(1),
         ts_event=0,
         ts_init=0,
     )
@@ -335,17 +330,25 @@ def _run_engine_sync(
             "fills": [],
         }
 
-    # bypass_logging=True is critical: Nautilus's Rust FFI logger can only
-    # be initialized once per Python process. Without bypass, the second
-    # backtest call would panic ("attempted to set a logger after the
-    # logging system was already initialized") and crash the worker
-    # thread. Bypassing also makes runs much quieter — Nautilus's normal
-    # output is hundreds of lines per backtest.
-    config = BacktestEngineConfig(
+    # Build the strategy from registry + user params.
+    try:
+        strategy, config = _build_strategy(info, user_params, instrument_id, bar_type)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"failed to build {strategy_name}({user_params}): {type(e).__name__}: {e}",
+            "stats": {}, "equity_curve": [], "trades": [], "fills": [],
+        }
+
+    # bypass_logging=True is critical: Nautilus's Rust FFI logger can
+    # only initialize once per Python process. Without bypass the second
+    # backtest call panics ("logger already initialized") and crashes
+    # the worker thread.
+    engine_config = BacktestEngineConfig(
         trader_id=TraderId("BT-001"),
         logging=LoggingConfig(bypass_logging=True),
     )
-    engine = BacktestEngine(config=config)
+    engine = BacktestEngine(config=engine_config)
     try:
         engine.add_venue(
             venue=venue,
@@ -360,23 +363,10 @@ def _run_engine_sync(
         engine.portfolio.analyzer.register_statistic(SharpeRatio())
         engine.portfolio.analyzer.register_statistic(MaxDrawdown())
 
-        engine.add_strategy(
-            BuyAndHold(
-                BuyAndHoldConfig(
-                    instrument_id=instrument_id,
-                    bar_type=bar_type,
-                    trade_size=Decimal(str(trade_size)),
-                )
-            )
-        )
-
+        engine.add_strategy(strategy)
         engine.run()
 
-        # Reports ----------------------------------------------------------
-        try:
-            account_report = engine.trader.generate_account_report(venue)
-        except Exception:
-            account_report = None
+        # Reports
         try:
             fills_report = engine.trader.generate_order_fills_report()
         except Exception:
@@ -386,7 +376,6 @@ def _run_engine_sync(
         except Exception:
             positions_report = None
 
-        # Stats ------------------------------------------------------------
         try:
             stats_pnl = engine.portfolio.analyzer.get_performance_stats_pnls(USD)
         except Exception:
@@ -399,17 +388,12 @@ def _run_engine_sync(
         positions_records = _df_to_records(positions_report)
         fills_records = _df_to_records(fills_report)
 
-        # Build a proper mark-to-market equity curve from bars + fills.
-        # Nautilus's account_report is useless for this — see
-        # _compute_equity_curve docstring.
         equity_curve = _compute_equity_curve(
             bars_raw=bars_raw,
             fills_records=fills_records,
             starting_cash=starting_cash,
         )
 
-        # Sum realized pnl from positions (engine.portfolio numbers can be None
-        # when the position closed exactly at the last bar; this is a fallback).
         realized_pnl = 0.0
         for p in positions_records:
             v = _safe_float(p.get("realized_pnl"))
@@ -434,16 +418,13 @@ def _run_engine_sync(
             "trough_equity": _safe_float(trough_eq),
             "total_return_pct": _safe_float(total_return_pct),
             "realized_pnl": _safe_float(realized_pnl),
-            # Nautilus's Sharpe is computed from its own (broken-for-our-case)
-            # returns series; surface it but with the caveat that it's only
-            # meaningful once we compute returns from our own equity curve.
             "sharpe_ratio": _safe_float(stats_returns.get("Sharpe Ratio (252 days)")),
             "max_drawdown_pct": max_dd_pct,
             "trade_count": len(positions_records),
             "bar_count": len(nautilus_bars),
             "bars_dropped_invalid": dropped,
         }
-        # Surface any other stat strings Nautilus computed, for transparency.
+
         extra_stats: dict[str, Any] = {}
         for source in (stats_pnl, stats_returns):
             for k, v in (source or {}).items():
@@ -451,14 +432,25 @@ def _run_engine_sync(
                 if fv is not None:
                     extra_stats[k] = fv
 
+        # Echo back the resolved params for transparency (msgspec converts
+        # them to native Python; jsonable-ize Decimals).
+        resolved_params: dict[str, Any] = {}
+        for fname in info.params_schema.keys():
+            try:
+                resolved_params[fname] = _jsonable(getattr(config, fname))
+            except AttributeError:
+                pass
+
         return {
             "ok": True,
             "symbol": symbol,
+            "strategy": info.name,
+            "params": resolved_params,
             "stats": stats,
             "extra_stats": extra_stats,
             "equity_curve": equity_curve,
             "trades": positions_records,
-            "fills": _df_to_records(fills_report),
+            "fills": fills_records,
         }
     finally:
         try:
@@ -467,14 +459,27 @@ def _run_engine_sync(
             log.warning("engine.dispose() failed: %s", e)
 
 
-async def run_buy_and_hold(
+def _jsonable(v: Any) -> Any:
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    return str(v)
+
+
+async def run_backtest(
     bars_raw: list[dict[str, Any]],
     symbol: str,
+    strategy_name: str = "BuyAndHold",
+    params: dict[str, Any] | None = None,
     starting_cash: float = 100_000.0,
-    trade_size: float = 100.0,
 ) -> dict[str, Any]:
-    """Async wrapper. Pushes the CPU-bound run onto a worker thread so the
+    """Async wrapper around _run_engine_sync. The Nautilus engine is
+    CPU-bound and synchronous — push it onto a worker thread so the
     FastAPI event loop doesn't block."""
     return await asyncio.to_thread(
-        _run_engine_sync, bars_raw, symbol.upper(), starting_cash, trade_size
+        _run_engine_sync,
+        bars_raw,
+        symbol.upper(),
+        starting_cash,
+        strategy_name,
+        params or {},
     )

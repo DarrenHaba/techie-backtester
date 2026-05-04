@@ -1080,6 +1080,23 @@ type = "directory"
 url = "../techie-cortex"
 
 [[package]]
+name = "techie-strategies-private"
+version = "0.1.0a0"
+description = "Private strategy implementations and research artifacts for the Techie trading ecosystem. Imported by techie-backtester (offline) and techie-bot (live)."
+optional = false
+python-versions = ">=3.13,<3.14"
+groups = ["main"]
+files = []
+develop = true
+
+[package.dependencies]
+nautilus_trader = ">=1.226"
+
+[package.source]
+type = "directory"
+url = "../techie-strategies-private"
+
+[[package]]
 name = "tqdm"
 version = "4.67.3"
 description = "Fast, Extensible Progress Meter"
@@ -1420,4 +1437,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13,<3.14"
-content-hash = "3ce110e660dd81b3eec80d6058e1044e5bd05856971a4ec95979ec5a4841b1c2"
+content-hash = "5f599f2d3c11482886777bd576f516660da306c09e91d86bb8f4513bcf95d744"
